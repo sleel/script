@@ -1,0 +1,271 @@
+#
+# Based on: https://github.com/P3TERX/Actions-OpenWrt
+#
+
+name: AutoBuild-OpenWrt
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+  schedule:
+    - cron: "7 0 */10 * *"
+
+concurrency:
+  group: openwrt-build
+  cancel-in-progress: false
+
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown "$USER":"$USER" /workdir
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        set -euo pipefail
+        git clone "$REPO_URL" -b "$REPO_BRANCH" --depth=1 openwrt
+        cd openwrt
+        echo "SOURCE_COMMIT_SHORT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+        ln -sf /workdir/openwrt "$GITHUB_WORKSPACE"/openwrt
+
+    - name: Load custom feeds
+      run: |
+        set -euo pipefail
+        if [ -e "$FEEDS_CONF" ]; then
+          mv "$FEEDS_CONF" openwrt/feeds.conf.default
+        fi
+        chmod +x "$DIY_P1_SH"
+        cd openwrt
+        "$GITHUB_WORKSPACE/$DIY_P1_SH"
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |
+        set -euo pipefail
+        if [ -e files ]; then
+          mv files openwrt/files
+        fi
+        if [ -e "$CONFIG_FILE" ]; then
+          mv "$CONFIG_FILE" openwrt/.config
+        fi
+        chmod +x "$DIY_P2_SH"
+        cd openwrt
+        "$GITHUB_WORKSPACE/$DIY_P2_SH"
+
+    - name: Generate config hash
+      run: |
+        set -euo pipefail
+        cd openwrt
+        make defconfig
+        CONFIG_SHA256=$(sha256sum .config | awk '{print $1}')
+        echo "CONFIG_SHA256=$CONFIG_SHA256" >> "$GITHUB_ENV"
+
+    - name: Cache downloaded packages
+      uses: actions/cache@v4
+      with:
+        path: /workdir/openwrt/dl
+        key: dl-${{ env.CONFIG_SHA256 }}
+        restore-keys: |
+          dl-
+
+    - name: Download package
+      run: |
+        set -euo pipefail
+        cd openwrt
+        make download -j8
+        find dl -type f -size -1024c -print -delete
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        set -uo pipefail   # 不用 -e：需手动捕获 make 失败并做单线程回退
+        cd openwrt
+        BUILD_OK=0
+        if make -j"$(nproc)"; then BUILD_OK=1; elif make -j1 V=s; then BUILD_OK=1; fi
+        if [ "$BUILD_OK" -ne 1 ]; then
+          echo "status=failure" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+        echo "status=success" >> "$GITHUB_OUTPUT"
+
+        # 设备标识：BOARD-DEVICE_NAME，取不到则退化为 BOARD
+        DEVICE_NAME=""
+        BOARD=$(awk -F'"' '/^CONFIG_TARGET_BOARD=/ {print $2}' .config)
+        SUBTARGET=$(awk -F'"' '/^CONFIG_TARGET_SUBTARGET=/ {print $2}' .config)
+        if grep -q '^CONFIG_TARGET.*DEVICE.*=y' .config; then
+          DEVICE_NAME=$(grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' | head -n1)
+        fi
+        if [ -n "$BOARD" ] && [ -n "$DEVICE_NAME" ]; then
+          PLATFORM="${BOARD}-${DEVICE_NAME}"
+        elif [ -n "$DEVICE_NAME" ]; then
+          PLATFORM="$DEVICE_NAME"
+        else
+          PLATFORM="${BOARD:-unknown}"
+        fi
+
+        # 内核大版本：处理 CONFIG_TESTING_KERNEL 覆盖（开启时实际用 KERNEL_TESTING_PATCHVER）
+        MK=""
+        if [ -n "$BOARD" ] && [ -n "$SUBTARGET" ] && [ -f "target/linux/${BOARD}/${SUBTARGET}/Makefile" ]; then
+          MK="target/linux/${BOARD}/${SUBTARGET}/Makefile"
+        elif [ -n "$BOARD" ] && [ -f "target/linux/${BOARD}/Makefile" ]; then
+          MK="target/linux/${BOARD}/Makefile"
+        fi
+        KVER=""
+        if [ -n "$MK" ]; then
+          if grep -q '^CONFIG_TESTING_KERNEL=y' .config; then
+            KVER=$(awk -F':=' '/^KERNEL_TESTING_PATCHVER:=/{print $2;exit}' "$MK" | tr -d '[:space:]')
+          fi
+          if [ -z "$KVER" ]; then
+            KVER=$(awk -F':=' '/^KERNEL_PATCHVER:=/{print $2;exit}' "$MK" | tr -d '[:space:]')
+          fi
+        fi
+        KVER=${KVER:-unknown}
+
+        # 内核补丁号：新结构 target/linux/generic/kernel-<KVER>（openwrt/immortalwrt），
+        # 旧结构 include/kernel-<KVER>（lede 尚未迁移），两条都试
+        PATCH=""
+        if [ "$KVER" != "unknown" ]; then
+          for CANDIDATE in "target/linux/generic/kernel-${KVER}" "include/kernel-${KVER}"; do
+            if [ -f "$CANDIDATE" ]; then
+              PATCH=$(awk -F'=' -v k="$KVER" '$0 ~ "^LINUX_VERSION-"k"[[:space:]]*=" {print $2;exit}' "$CANDIDATE" | tr -d '[:space:]')
+              [ -n "$PATCH" ] && break
+            fi
+          done
+        fi
+        KERNEL_VER="${KVER}${PATCH}"
+
+        # LuCI 版本：分支追踪号(feeds.conf.default) + 实际 commit(feeds/luci)
+        # lede 带 ;openwrt-XX.XX 后缀，immortalwrt/官方 openwrt 不带；
+        # 先 grep 判断避免 sed 无匹配时原样吐出整行污染 TRACK
+        LINE=$(grep -m1 -E '^src-git[[:space:]]+luci[[:space:]]' feeds.conf.default 2>/dev/null || true)
+        TRACK=""
+        if echo "$LINE" | grep -q ';openwrt-'; then
+          TRACK=$(echo "$LINE" | sed -E 's/.*;openwrt-([0-9.]+).*/\1/' | tr -d '.')
+        fi
+        [ -z "$TRACK" ] && TRACK="master"
+        LUCI_COMMIT=$(git -C feeds/luci rev-parse --short HEAD 2>/dev/null)
+        LUCI_VER="${TRACK}.${LUCI_COMMIT:-unknown}"
+
+        {
+          echo "FILE_DATE=_$(date +"%Y%m%d%H%M")"
+          echo "FILE_TIME=$(date "+%Y年%m月%d日-%H点")"
+          echo "PLATFORM=$PLATFORM"
+          echo "KERNEL_VER=$KERNEL_VER"
+          echo "LUCI_VER=$LUCI_VER"
+        } >> "$GITHUB_ENV"
+
+        echo "Platform: $PLATFORM | Kernel: $KERNEL_VER (base=$KVER patch=$PATCH via ${MK:-N/A}) | LuCI: $LUCI_VER | Commit: $SOURCE_COMMIT_SHORT"
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Organize files
+      id: organize
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        set -euo pipefail
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        DATE_STR=$(date +"%Y%m%d")
+        shopt -s nullglob
+        FOUND=0
+        for file in *.img.gz *.tar.gz *.bin; do
+          [ -f "$file" ] || continue
+          FOUND=1
+          new_name="${DATE_STR}-$(echo "$file" | sed -E "s/^(openwrt|immortalwrt|lede)-/\1-${KERNEL_VER}-luci${LUCI_VER}-/")"
+          mv -- "$file" "$new_name"
+          if [ -f sha256sums ]; then
+            awk -v old="$file" -v new="$new_name" '{if($NF==old){print substr($0,1,length($0)-length(old)) new}else{print}}' sha256sums > t && mv t sha256sums
+          fi
+        done
+        if [ "$FOUND" -eq 0 ]; then
+          echo "::error::No firmware found."
+          exit 1
+        fi
+        echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+        echo "status=success" >> "$GITHUB_OUTPUT"
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && success()
+      run: |
+        set -euo pipefail
+        {
+          echo "Source: $REPO_URL"
+          echo "Branch: $REPO_BRANCH"
+          echo "Platform: $PLATFORM"
+          echo "Kernel: $KERNEL_VER"
+          echo "LuCI: $LUCI_VER"
+          echo "Commit: $SOURCE_COMMIT_SHORT"
+          echo "Config SHA256: $CONFIG_SHA256"
+        } >> release.txt
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")-${SOURCE_COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
+        echo "status=success" >> "$GITHUB_OUTPUT"
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v2
+      if: steps.tag.outputs.status == 'success' && success()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        name: ${{ env.FILE_TIME }} 「 OpenWrt-${{ env.PLATFORM }}-${{ env.KERNEL_VER }}-luci${{ env.LUCI_VER }} 」
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        fail_on_unmatched_files: true
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@v2
+      if: success()
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        repository: ${{ github.repository }}
+        retain_days: 10
+        keep_minimum_runs: 3
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@v0.3.3
+      if: env.UPLOAD_RELEASE == 'true' && success()
+      with:
+        keep_latest: 99
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
