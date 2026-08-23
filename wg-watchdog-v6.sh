@@ -4,7 +4,7 @@
 # 用途：主服务器切换到 IPv6 时使用（例如运营商封锁 IPv4 时的备用方案）
 
 WG_IF="wg0"
-THRESHOLD=600
+THRESHOLD=300
 PING_HOST="10.0.198.1"
 
 DDNS_DOMAIN="your-ddns-domain.example.com"
