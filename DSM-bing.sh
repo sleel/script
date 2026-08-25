@@ -12,6 +12,9 @@ lang="zh-CN"
 # 修改用户桌面壁纸（替换系统 wallpaper1），仅在 DSM7.x 测试过
 #desktop=yes
 
+# 已知限制：Bing JSON 中出现转义引号 \" 时（极低概率），title/copyright 的
+# sed 解析会在该处被截断，DSM busybox 无 jq 可用，接受为已知限制。
+
 set -u
 
 log() { echo "[x]$1"; }
@@ -38,7 +41,11 @@ echo "$pic" | grep -q startdate || die "Unexpected response format, aborting."
 if [ "${res:-}" = "raw" ]; then
   # raw: 从 urlbase 字段拼接原图链接，不带任何分辨率后缀
   urlbase=$(echo "$pic" | sed 's/.\+"urlbase":"//g' | sed 's/".\+//g')
-  [ -n "$urlbase" ] || die "Failed to parse urlbase for raw image."
+  # 拼接前先校验 urlbase 形态，避免解析出垃圾字符串后无条件拼出看似合法的 .jpg 链接
+  case "$urlbase" in
+    /th\?*) : ;;
+    *) die "Failed to parse urlbase for raw image: '$urlbase'" ;;
+  esac
   link="https://www.bing.com${urlbase}.jpg"
 else
   link=$(echo "$pic" | sed 's/.\+"url"[:" ]\+//g' | sed 's/".\+//g')
