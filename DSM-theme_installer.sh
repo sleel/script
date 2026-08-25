@@ -7,8 +7,8 @@ set -o pipefail
 
 # ---------- 基础校验 ----------
 if [ "$(id -u)" -ne 0 ]; then
-    echo "❌ 请使用 root 权限运行本脚本 (例如: sudo $0)"
-    exit 1
+echo "❌ 请使用 root 权限运行本脚本 (例如: sudo $0)"
+exit 1
 fi
 
 PERSISTENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,18 +23,18 @@ INJECT_MARK="__CUSTOM_THEME_V10_MARK__"
 INJECT_JS=";/*${INJECT_MARK}*/var _dsmlink=document.createElement('link');_dsmlink.rel='stylesheet';_dsmlink.type='text/css';_dsmlink.href='/webman/login/custom_theme.css?v=10.0';document.head.appendChild(_dsmlink);"
 
 if [ ! -d "$WEBMAN_LOGIN_DIR" ]; then
-    echo "❌ 致命错误：未找到 DSM 登录页目录 ($WEBMAN_LOGIN_DIR)，请确认系统版本或路径是否正确"
-    exit 1
+echo "❌ 致命错误：未找到 DSM 登录页目录 ($WEBMAN_LOGIN_DIR)，请确认系统版本或路径是否正确"
+exit 1
 fi
 
 if [ ! -f "$LOGIN_JS" ]; then
-    echo "❌ 致命错误：无法找到 DSM 登录页入口文件 ($LOGIN_JS)"
-    exit 1
+echo "❌ 致命错误：无法找到 DSM 登录页入口文件 ($LOGIN_JS)"
+exit 1
 fi
 
 if [ ! -w "$PERSISTENT_DIR" ]; then
-    echo "❌ 致命错误：脚本所在目录不可写 ($PERSISTENT_DIR)，无法生成主题缓存文件"
-    exit 1
+echo "❌ 致命错误：脚本所在目录不可写 ($PERSISTENT_DIR)，无法生成主题缓存文件"
+exit 1
 fi
 
 # ================= CSS 主题生成引擎 =================
@@ -153,99 +153,115 @@ EOF
 # ================= 核心注入逻辑 =================
 
 apply_theme() {
-    if ! cp -f "$PERSISTENT_CSS" "$TARGET_CSS"; then
-        echo "❌ CSS 文件拷贝失败，请检查磁盘空间及权限"
-        exit 1
-    fi
-    chmod 644 "$TARGET_CSS" || echo "⚠️ 警告：chmod 失败，权限可能不正确"
+if ! cp -f "$PERSISTENT_CSS" "$TARGET_CSS"; then
+echo "❌ CSS 文件拷贝失败，请检查磁盘空间及权限"
+exit 1
+fi
+chmod 644 "$TARGET_CSS" || echo "⚠️ 警告：chmod 失败，权限可能不正确"
 
-    if grep -qF "$INJECT_MARK" "$LOGIN_JS"; then
-        echo "✅ 主题样式已无缝刷新！"
-        echo "💡 提示: 由于启用了极速缓存，请务必按 【Ctrl + F5】 强制刷新浏览器查看最新效果！"
-        return
-    fi
+if grep -qF "$INJECT_MARK" "$LOGIN_JS"; then
+echo "✅ 主题样式已无缝刷新！"
+echo "💡 提示: 由于启用了极速缓存，请务必按 【Ctrl + F5】 强制刷新浏览器查看最新效果！"
+return
+fi
 
-    echo "⚙️ 首次应用新结构，正在构建底层防御备份..."
-    if [ ! -f "${LOGIN_JS}.bak" ]; then
-        if ! cp -p "$LOGIN_JS" "${LOGIN_JS}.bak"; then
-            echo "❌ 备份原始 JS 文件失败，为安全起见已中止注入"
-            exit 1
-        fi
-    fi
-    if [ -f "${LOGIN_JS}.gz" ] && [ ! -f "${LOGIN_JS}.gz.bak" ]; then
-        cp -p "${LOGIN_JS}.gz" "${LOGIN_JS}.gz.bak" || echo "⚠️ 警告：gz 备份失败"
-    fi
+echo "⚙️ 首次应用新结构，正在构建底层防御备份..."
 
-    if ! echo -n "$INJECT_JS" >> "$LOGIN_JS"; then
-        echo "❌ 写入注入代码失败，正在尝试自动回滚..."
-        cp -pf "${LOGIN_JS}.bak" "$LOGIN_JS" 2>/dev/null
-        exit 1
-    fi
+# 关键修复：DSM 更新后 login bundle 会被官方替换成新版本，但 .bak 仍是旧版残留。
+# 标记不存在(即将执行首次注入)时，当前 LOGIN_JS 必然是"干净"的官方文件，
+# 若它与已有 .bak 内容不一致，说明 DSM 已经更新过，必须刷新备份，
+# 否则日后卸载会把过期的旧版 bundle 覆盖回当前系统，导致登录页 JS 与 DSM 版本不匹配。
+if [ -f "${LOGIN_JS}.bak" ] && ! cmp -s "$LOGIN_JS" "${LOGIN_JS}.bak"; then
+echo "ℹ️ 检测到 DSM 登录页文件已更新，刷新备份基线..."
+if ! cp -p "$LOGIN_JS" "${LOGIN_JS}.bak"; then
+echo "❌ 刷新备份失败，为安全起见已中止注入"
+exit 1
+fi
+elif [ ! -f "${LOGIN_JS}.bak" ]; then
+if ! cp -p "$LOGIN_JS" "${LOGIN_JS}.bak"; then
+echo "❌ 备份原始 JS 文件失败，为安全起见已中止注入"
+exit 1
+fi
+fi
 
-    if [ -f "${LOGIN_JS}.gz.bak" ]; then
-        OWNER=$(stat -c "%U:%G" "${LOGIN_JS}.gz.bak")
-        PERM=$(stat -c "%a" "${LOGIN_JS}.gz.bak")
-        if gzip -c "$LOGIN_JS" > "${LOGIN_JS}.gz"; then
-            chown "$OWNER" "${LOGIN_JS}.gz" 2>/dev/null
-            chmod "$PERM" "${LOGIN_JS}.gz" 2>/dev/null
-        else
-            echo "⚠️ 警告：gzip 重新压缩失败，浏览器可能仍加载旧版预压缩文件"
-        fi
-    else
-        echo "ℹ️ 未检测到预压缩 .gz 文件，跳过 gzip 重建（当前环境可能未启用预压缩）"
-    fi
+if [ -f "${LOGIN_JS}.gz" ]; then
+if [ ! -f "${LOGIN_JS}.gz.bak" ] || ! cmp -s "${LOGIN_JS}.gz" "${LOGIN_JS}.gz.bak"; then
+cp -p "${LOGIN_JS}.gz" "${LOGIN_JS}.gz.bak" || echo "⚠️ 警告：gz 备份失败"
+fi
+fi
 
-    echo "🎉 前端极速缓存版劫持成功！请在浏览器中按 Ctrl+F5 强制刷新查看效果。"
+if ! echo -n "$INJECT_JS" >> "$LOGIN_JS"; then
+echo "❌ 写入注入代码失败，正在尝试自动回滚..."
+cp -pf "${LOGIN_JS}.bak" "$LOGIN_JS" 2>/dev/null
+exit 1
+fi
+
+if [ -f "${LOGIN_JS}.gz.bak" ]; then
+OWNER=$(stat -c "%U:%G" "${LOGIN_JS}.gz.bak")
+PERM=$(stat -c "%a" "${LOGIN_JS}.gz.bak")
+if gzip -cn "$LOGIN_JS" > "${LOGIN_JS}.gz"; then
+chown "$OWNER" "${LOGIN_JS}.gz" 2>/dev/null
+chmod "$PERM" "${LOGIN_JS}.gz" 2>/dev/null
+else
+echo "⚠️ 警告：gzip 重新压缩失败，浏览器可能仍加载旧版预压缩文件"
+fi
+else
+echo "ℹ️ 未检测到预压缩 .gz 文件，跳过 gzip 重建（当前环境可能未启用预压缩）"
+fi
+
+echo "🎉 前端极速缓存版劫持成功！请在浏览器中按 Ctrl+F5 强制刷新查看效果。"
 }
 
 # ================= 安全回滚逻辑 =================
 
 uninstall_theme() {
-    echo "🔄 正在执行安全物理回滚..."
-    if [ -f "${LOGIN_JS}.bak" ]; then
-        cp -pf "${LOGIN_JS}.bak" "$LOGIN_JS" && rm -f "${LOGIN_JS}.bak"
-    else
-        echo "ℹ️ 未发现 JS 备份，跳过 JS 还原"
-    fi
+echo "🔄 正在执行安全物理回滚..."
+if [ -f "${LOGIN_JS}.bak" ]; then
+cp -pf "${LOGIN_JS}.bak" "$LOGIN_JS" && rm -f "${LOGIN_JS}.bak"
+else
+echo "ℹ️ 未发现 JS 备份，跳过 JS 还原"
+fi
 
-    if [ -f "${LOGIN_JS}.gz.bak" ]; then
-        cp -pf "${LOGIN_JS}.gz.bak" "${LOGIN_JS}.gz" && rm -f "${LOGIN_JS}.gz.bak"
-    elif [ -f "$LOGIN_JS" ]; then
-        OWNER=$(stat -c "%U:%G" "${LOGIN_JS}")
-        gzip -c "$LOGIN_JS" > "${LOGIN_JS}.gz" && chown "$OWNER" "${LOGIN_JS}.gz"
-    fi
+# 关键修复：只有当 .gz 原本就存在时才重建，否则会在从未启用预压缩的环境里
+# "凭空"造出一个系统本不该有的 .gz 文件，违背"无损恢复出厂"的承诺
+if [ -f "${LOGIN_JS}.gz.bak" ]; then
+cp -pf "${LOGIN_JS}.gz.bak" "${LOGIN_JS}.gz" && rm -f "${LOGIN_JS}.gz.bak"
+elif [ -f "${LOGIN_JS}.gz" ]; then
+OWNER=$(stat -c "%U:%G" "${LOGIN_JS}")
+gzip -cn "$LOGIN_JS" > "${LOGIN_JS}.gz" && chown "$OWNER" "${LOGIN_JS}.gz"
+fi
 
-    if [ -f "$TARGET_CSS" ]; then
-        rm -f "$TARGET_CSS"
-    fi
-    echo "✅ 系统已完全、无损恢复为出厂默认状态！记得按 Ctrl+F5 刷新。"
+if [ -f "$TARGET_CSS" ]; then
+rm -f "$TARGET_CSS"
+fi
+echo "✅ 系统已完全、无损恢复为出厂默认状态！记得按 Ctrl+F5 刷新。"
 }
 
 # ================= 终端交互面板 =================
 
 run_choice() {
-    case "$1" in
-        1) generate_light_css; apply_theme ;;
-        2) generate_dark_css; apply_theme ;;
-        3) generate_macos_css; apply_theme ;;
-        4) generate_win11_css; apply_theme ;;
-        5) generate_nordic_css; apply_theme ;;
-        6) generate_aurora_css; apply_theme ;;
-        9) uninstall_theme ;;
-        q|Q) echo "👋 退出程序"; exit 0 ;;
-        *) echo "⚠️ 无效选项！"; exit 1 ;;
-    esac
+case "$1" in
+1) generate_light_css && apply_theme ;;
+2) generate_dark_css && apply_theme ;;
+3) generate_macos_css && apply_theme ;;
+4) generate_win11_css && apply_theme ;;
+5) generate_nordic_css && apply_theme ;;
+6) generate_aurora_css && apply_theme ;;
+9) uninstall_theme ;;
+q|Q) echo "👋 退出程序"; exit 0 ;;
+*) echo "⚠️ 无效选项！"; exit 1 ;;
+esac
 }
 
 # 支持命令行参数直接调用，便于自动化: ./script.sh 3
 if [ -n "$1" ]; then
-    run_choice "$1"
-    exit 0
+run_choice "$1"
+exit 0
 fi
 
 clear
 echo "=========================================="
-echo "    DSM 7.4+ Login Theme Universal        "
+echo " DSM 7.4+ Login Theme Universal "
 echo "=========================================="
 echo " 1. 【经典】浅色毛玻璃"
 echo " 2. 【经典】深色半透明"
